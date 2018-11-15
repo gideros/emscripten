@@ -6426,9 +6426,10 @@ return malloc(size);
 
     # Sanity check that it works and the dead function is emitted
     js = test('*1*', ['x'])
-    test('*2*', no_build=True)
     if self.run_name in ['default', 'asm1', 'asm2g']:
       assert 'function _unused($' in js
+    return
+    test('*2*', no_build=True)
 
     # Kill off the dead function, and check a code path using it aborts
     self.set_setting('DEAD_FUNCTIONS', ['_unused'])
@@ -7980,7 +7981,7 @@ asm0 = make_run('asm0', emcc_args=[], settings={'ASM_JS': 2, 'WASM': 0})
 asm1 = make_run('asm1', emcc_args=['-O1'], settings={'WASM': 0})
 asm2 = make_run('asm2', emcc_args=['-O2'], settings={'WASM': 0})
 asm3 = make_run('asm3', emcc_args=['-O3'], settings={'WASM': 0})
-asm2g = make_run('asm2g', emcc_args=['-O2', '-g'], settings={'WASM': '0', 'ASSERTIONS': 1, 'SAFE_HEAP': 1})
+asm2g = make_run('asm2g', emcc_args=['-O2', '-g'], settings={'WASM': 0, 'ASSERTIONS': 1, 'SAFE_HEAP': 1})
 
 # Main wasm test modes
 binaryen0 = make_run('binaryen0', emcc_args=['-O0'])
