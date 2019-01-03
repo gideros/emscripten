@@ -17,7 +17,7 @@ import zlib
 if __name__ == '__main__':
   raise Exception('do not run this file directly; do something like: tests/runner.py benchmark')
 
-from runner import RunnerCore, chdir
+from runner import RunnerCore, chdir, get_poppler_library
 from tools.shared import run_process, path_from_root, CLANG, Building, SPIDERMONKEY_ENGINE, LLVM_ROOT, CLOSURE_COMPILER, CLANG_CC, V8_ENGINE, PIPE, try_delete, PYTHON, EMCC
 from tools import shared, jsrun
 
@@ -43,6 +43,8 @@ non_core = unittest.skipIf(CORE_BENCHMARKS, "only running core benchmarks")
 IGNORE_COMPILATION = 0
 
 OPTIMIZATIONS = '-O3'
+
+PROFILING = 0
 
 
 class Benchmarker(object):
@@ -92,8 +94,8 @@ class Benchmarker(object):
 
     # size
 
-    size = sum([os.stat(f).st_size for f in self.get_output_files()])
-    gzip_size = sum([len(zlib.compress(open(f).read())) for f in self.get_output_files()])
+    size = sum(os.path.getsize(f) for f in self.get_output_files())
+    gzip_size = sum(len(zlib.compress(open(f).read())) for f in self.get_output_files())
 
     print('        size: %8s, compressed: %8s' % (size, gzip_size), end=' ')
     if self.get_size_text():
@@ -144,10 +146,13 @@ class NativeBenchmarker(Benchmarker):
   def get_size_text(self):
     return 'dynamically linked - libc etc. are not included!'
 
+  def cleanup(self):
+    pass
+
 
 def run_binaryen_opts(filename, opts):
   run_process([
-    os.path.join(Building.get_binaryen_bin(), 'wasm-opt'),
+    os.path.join(Building.get_binaryen_bin(), 'wasm-opt', '--all-features'),
     filename,
     '-o', filename
   ] + opts)
@@ -165,6 +170,8 @@ class EmscriptenBenchmarker(Benchmarker):
 
   def build(self, parent, filename, args, shared_args, emcc_args, native_args, native_exec, lib_builder, has_output_parser):
     self.filename = filename
+    self.old_env = os.environ
+    os.environ = self.env.copy()
     llvm_root = self.env.get('LLVM') or LLVM_ROOT
     if lib_builder:
       emcc_args = emcc_args + lib_builder('js_' + llvm_root, native=False, env_init=self.env.copy())
@@ -187,13 +194,14 @@ process(sys.argv[1])
       '--js-transform', 'python hardcode.py',
       '-s', 'TOTAL_MEMORY=256*1024*1024',
       '-s', 'FILESYSTEM=0',
-      # '--profiling',
       '--closure', '1',
       '-s', 'BENCHMARK=%d' % (1 if IGNORE_COMPILATION and not has_output_parser else 0),
       '-o', final
     ] + shared_args + emcc_args + self.extra_args
     if 'FORCE_FILESYSTEM=1' in cmd:
       cmd = [arg if arg != 'FILESYSTEM=0' else 'FILESYSTEM=1' for arg in cmd]
+    if PROFILING:
+      cmd += ['--profiling-funcs']
     output = run_process(cmd, stdout=PIPE, stderr=PIPE, env=self.env).stdout
     assert os.path.exists(final), 'Failed to compile file: ' + output + ' (looked for ' + final + ')'
     if self.binaryen_opts:
@@ -210,6 +218,10 @@ process(sys.argv[1])
     else:
       ret.append(self.filename[:-3] + '.wasm')
     return ret
+
+  def cleanup(self):
+    os.environ = self.old_env
+    Building.clear()
 
 
 CHEERP_BIN = '/opt/cheerp/bin/'
@@ -342,6 +354,9 @@ class CheerpBenchmarker(Benchmarker):
       'files': []
     }
 
+  def cleanup(self):
+    pass
+
 
 # Benchmarkers
 try:
@@ -352,17 +367,27 @@ try:
   ]
   if SPIDERMONKEY_ENGINE and SPIDERMONKEY_ENGINE in shared.JS_ENGINES:
     benchmarkers += [
-      EmscriptenBenchmarker('sm-asmjs', SPIDERMONKEY_ENGINE, ['-s', 'PRECISE_F32=2', '-s', 'WASM=0']),
-      EmscriptenBenchmarker('sm-asm2wasm',  SPIDERMONKEY_ENGINE + ['--no-wasm-baseline'], []),
-      # EmscriptenBenchmarker('sm-asm2wasm-lto',  SPIDERMONKEY_ENGINE + ['--no-wasm-baseline'], ['--llvm-lto', '1']),
-      # EmscriptenBenchmarker('sm-wasmbackend',  SPIDERMONKEY_ENGINE + ['--no-wasm-baseline'], env={
-      #   'LLVM': '/home/alon/Dev/llvm/build/bin',
-      #   'EMCC_WASM_BACKEND': '1',
+      # EmscriptenBenchmarker('sm-asmjs', SPIDERMONKEY_ENGINE, ['-s', 'WASM=0']),
+      # EmscriptenBenchmarker('sm-asm2wasm',  SPIDERMONKEY_ENGINE + ['--no-wasm-baseline'], []),
+      # EmscriptenBenchmarker('v8-wasmbc',  V8_ENGINE, env={
+      #  'LLVM': os.path.expanduser('~/Dev/llvm/build/bin'),
+      # }),
+      # EmscriptenBenchmarker('v8-wasmobj',  V8_ENGINE, ['-s', 'WASM_OBJECT_FILES=1'], env={
+      #  'LLVM': os.path.expanduser('~/Dev/llvm/build/bin'),
       # }),
     ]
   if V8_ENGINE and V8_ENGINE in shared.JS_ENGINES:
     benchmarkers += [
-      EmscriptenBenchmarker('v8-wasm',  V8_ENGINE),
+      EmscriptenBenchmarker('v8-asmjs', V8_ENGINE, ['-s', 'WASM=0']),
+      EmscriptenBenchmarker('v8-asm2wasm',  V8_ENGINE, env={
+       'LLVM': os.path.expanduser('~/Dev/fastcomp/build/bin'),
+      }),
+      EmscriptenBenchmarker('v8-wasmbc',  V8_ENGINE, env={
+       'LLVM': os.path.expanduser('~/Dev/llvm/build/bin'),
+      }),
+      EmscriptenBenchmarker('v8-wasmobj',  V8_ENGINE, ['-s', 'WASM_OBJECT_FILES=1'], env={
+       'LLVM': os.path.expanduser('~/Dev/llvm/build/bin'),
+      }),
     ]
   if os.path.exists(CHEERP_BIN):
     benchmarkers += [
@@ -416,6 +441,7 @@ class benchmark(RunnerCore):
       b.build(self, filename, args, shared_args, emcc_args, native_args, native_exec, lib_builder, has_output_parser=output_parser is not None)
       b.bench(args, output_parser, reps)
       b.display(benchmarkers[0])
+      b.cleanup()
 
   def test_primes(self, check=True):
     src = r'''
@@ -965,10 +991,64 @@ class benchmark(RunnerCore):
                       shared_args=['-I' + path_from_root('tests', 'bullet', 'src'), '-I' + path_from_root('tests', 'bullet', 'Demos', 'Benchmarks')],
                       lib_builder=lib_builder)
 
-  def zzz_test_zzz_lzma(self):
+  def test_zzz_lzma(self):
     src = open(path_from_root('tests', 'lzma', 'benchmark.c'), 'r').read()
 
     def lib_builder(name, native, env_init):
       return self.get_library('lzma', [os.path.join('lzma.a')], configure=None, native=native, cache_name_extra=name, env_init=env_init)
 
     self.do_benchmark('lzma', src, 'ok.', shared_args=['-I' + path_from_root('tests', 'lzma')], lib_builder=lib_builder)
+
+  def test_zzz_sqlite(self):
+    src = open(path_from_root('tests', 'sqlite', 'sqlite3.c'), 'r').read() + open(path_from_root('tests', 'sqlite', 'speedtest1.c'), 'r').read()
+
+    self.do_benchmark('sqlite', src, 'ok.', shared_args=['-I' + path_from_root('tests', 'sqlite')], emcc_args=['-s', 'FILESYSTEM=1'], force_c=True)
+
+  def test_zzz_poppler(self):
+    with open('pre.js', 'w') as f:
+      f.write('''
+        var benchmarkArgument = %s;
+        var benchmarkArgumentToPageCount = {
+          '0': 0,
+          '1': 1,
+          '2': 5,
+          '3': 15,
+          '4': 26,
+          '5': 55,
+        };
+        if (benchmarkArgument === 0) {
+          Module.arguments = ['-?'];
+          Module.printErr = function(){};
+        } else {
+          // Add 'filename' after 'input.pdf' to write the output so it can be verified.
+          Module.arguments = ['-scale-to', '1024', 'input.pdf',  '-f', '1', '-l', '' + benchmarkArgumentToPageCount[benchmarkArgument]];
+          Module.postRun = function() {
+            var files = [];
+            for (var x in FS.root.contents) {
+              if (x.startsWith('filename-')) {
+                files.push(x);
+              }
+            }
+            files.sort();
+            var hash = 5381;
+            var totalSize = 0;
+            files.forEach(function(file) {
+              var data = MEMFS.getFileDataAsRegularArray(FS.root.contents[file]);
+              for (var i = 0; i < data.length; i++) {
+                hash = ((hash << 5) + hash) ^ (data[i] & 0xff);
+              }
+              totalSize += data.length;
+            });
+            out(files.length + ' files emitted, total output size: ' + totalSize + ', hashed printout: ' + hash);
+          };
+        }
+      ''' % DEFAULT_ARG)
+
+    def lib_builder(name, native, env_init):
+      return [get_poppler_library(self)]
+
+    # TODO: poppler in native build
+    self.do_benchmark('poppler', '', 'hashed printout',
+                      shared_args=['-I' + path_from_root('tests', 'poppler', 'include'), '-I' + path_from_root('tests', 'freetype', 'include')],
+                      emcc_args=['-s', 'FILESYSTEM=1', '--pre-js', 'pre.js', '--embed-file', path_from_root('tests', 'poppler', 'emscripten_html5.pdf') + '@input.pdf', '-s', 'ERROR_ON_UNDEFINED_SYMBOLS=0'],
+                      lib_builder=lib_builder)

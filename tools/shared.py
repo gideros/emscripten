@@ -27,13 +27,16 @@ from .tempfiles import try_delete
 from . import jsrun, cache, tempfiles, colored_logger
 from . import response_file
 
-colored_logger.enable()
-
 __rootpath__ = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
 WINDOWS = sys.platform.startswith('win')
 MACOS = sys.platform == 'darwin'
 LINUX = sys.platform.startswith('linux')
+DEBUG = int(os.environ.get('EMCC_DEBUG', '0'))
 
+# can add  %(asctime)s  to see timestamps
+logging.basicConfig(format='%(name)s:%(levelname)s: %(message)s',
+                    level=logging.DEBUG if DEBUG else logging.INFO)
+colored_logger.enable()
 logger = logging.getLogger('shared')
 
 
@@ -147,7 +150,9 @@ class Py2CompletedProcess:
       raise Py2CalledProcessError(returncode=self.returncode, cmd=self.args, output=self.stdout, stderr=self.stderr)
 
 
-def run_base(cmd, check=False, input=None, *args, **kw):
+def run_process(cmd, check=True, input=None, universal_newlines=True, *args, **kw):
+  kw.setdefault('universal_newlines', True)
+
   if hasattr(subprocess, "run"):
     return subprocess.run(cmd, check=check, input=input, *args, **kw)
 
@@ -162,10 +167,6 @@ def run_base(cmd, check=False, input=None, *args, **kw):
   return result
 
 
-def run_process(cmd, universal_newlines=True, check=True, *args, **kw):
-  return run_base(cmd, universal_newlines=universal_newlines, check=check, *args, **kw)
-
-
 def check_call(cmd, *args, **kw):
   try:
     proc = run_process(cmd, *args, **kw)
@@ -173,6 +174,8 @@ def check_call(cmd, *args, **kw):
     return proc
   except subprocess.CalledProcessError as e:
     exit_with_error("'%s' failed (%d)", ' '.join(cmd), e.returncode)
+  except OSError as e:
+    exit_with_error("'%s' failed: %s", ' '.join(cmd), str(e))
 
 
 def generate_config(path, first_time=False):
@@ -387,13 +390,13 @@ def expected_llvm_version():
 def get_clang_version():
   global actual_clang_version
   if actual_clang_version is None:
-    response = run_process([CLANG, '--version'], stdout=PIPE).stdout
-    m = re.search(r'[Vv]ersion\s+(\d+\.\d+)', response)
+    proc = check_call([CLANG, '--version'], stdout=PIPE)
+    m = re.search(r'[Vv]ersion\s+(\d+\.\d+)', proc.stdout)
     actual_clang_version = m and m.group(1)
   return actual_clang_version
 
 
-def check_clang_version():
+def check_llvm_version():
   expected = expected_llvm_version()
   actual = get_clang_version()
   if expected in actual:
@@ -402,20 +405,15 @@ def check_clang_version():
   return False
 
 
-def check_llvm_version():
-  try:
-    check_clang_version()
-  except Exception as e:
-    logger.critical('Could not verify LLVM version: %s' % str(e))
-
-
 def get_llc_targets():
   try:
     llc_version_info = run_process([LLVM_COMPILER, '--version'], stdout=PIPE).stdout
-    pre, targets = llc_version_info.split('Registered Targets:')
-    return targets
   except Exception as e:
     return '(no targets could be identified: ' + str(e) + ')'
+  if 'Registered Targets:' not in llc_version_info:
+    return '(no targets could be identified: ' + llc_version_info + ')'
+  pre, targets = llc_version_info.split('Registered Targets:')
+  return targets
 
 
 def has_asm_js_target(targets):
@@ -515,6 +513,30 @@ def generate_sanity():
   return EMSCRIPTEN_VERSION + '|' + LLVM_ROOT + '|' + get_clang_version() + ('_wasm' if Settings.WASM_BACKEND else '')
 
 
+def perform_sanify_checks():
+  logger.info('(Emscripten: Running sanity checks)')
+
+  with ToolchainProfiler.profile_block('sanity compiler_engine'):
+    if not jsrun.check_engine(COMPILER_ENGINE):
+      exit_with_error('The JavaScript shell used for compiling (%s) does not seem to work, check the paths in %s', COMPILER_ENGINE, EM_CONFIG)
+
+  with ToolchainProfiler.profile_block('sanity LLVM'):
+    for cmd in [CLANG, LLVM_LINK, LLVM_AR, LLVM_OPT, LLVM_AS, LLVM_DIS, LLVM_NM, LLVM_INTERPRETER]:
+      if not os.path.exists(cmd) and not os.path.exists(cmd + '.exe'):  # .exe extension required for Windows
+        exit_with_error('Cannot find %s, check the paths in %s', cmd, EM_CONFIG)
+
+  if not os.path.exists(PYTHON) and not os.path.exists(cmd + '.exe'):
+    try:
+      run_process([PYTHON, '--xversion'], stdout=PIPE, stderr=PIPE)
+    except (OSError, subprocess.CalledProcessError):
+      exit_with_error('Cannot find %s, check the paths in config file (%s)', PYTHON, CONFIG_FILE)
+
+  # Sanity check passed!
+  with ToolchainProfiler.profile_block('sanity closure compiler'):
+    if not check_closure_compiler():
+      logger.warning('closure compiler will not be available')
+
+
 def check_sanity(force=False):
   """Check that basic stuff we need (a JS engine to compile, Node.js, and Clang
   and LLVM) exists.
@@ -522,40 +544,40 @@ def check_sanity(force=False):
   The test runner always does this check (through |force|). emcc does this less
   frequently, only when ${EM_CONFIG}_sanity does not exist or is older than
   EM_CONFIG (so, we re-check sanity when the settings are changed).  We also
-  re-check sanity and clear the cache when the version changes"""
-  ToolchainProfiler.enter_block('sanity')
-  try:
+  re-check sanity and clear the cache when the version changes.
+  """
+  with ToolchainProfiler.profile_block('sanity'):
+    check_llvm_version()
+    expected = generate_sanity()
     if os.environ.get('EMCC_SKIP_SANITY_CHECK') == '1':
       return
     reason = None
     if not CONFIG_FILE:
       return # config stored directly in EM_CONFIG => skip sanity checks
-    else:
-      settings_mtime = os.stat(CONFIG_FILE).st_mtime
-      sanity_file = CONFIG_FILE + '_sanity'
-      if Settings.WASM_BACKEND:
-        sanity_file += '_wasm'
-      if os.path.exists(sanity_file):
-        try:
-          sanity_mtime = os.stat(sanity_file).st_mtime
-          if sanity_mtime <= settings_mtime:
-            reason = 'settings file has changed'
-          else:
-            sanity_data = open(sanity_file).read().rstrip('\n\r') # workaround weird bug with read() that appends new line char in some old python version
-            if sanity_data != generate_sanity():
-              reason = 'system change: %s vs %s' % (generate_sanity(), sanity_data)
-            else:
-              if not force:
-                return # all is well
-        except Exception as e:
-          reason = 'unknown: ' + str(e)
+
+    settings_mtime = os.path.getmtime(CONFIG_FILE)
+    sanity_file = CONFIG_FILE + '_sanity'
+    if Settings.WASM_BACKEND:
+      sanity_file += '_wasm'
+    if os.path.exists(sanity_file):
+      sanity_mtime = os.path.getmtime(sanity_file)
+      if sanity_mtime <= settings_mtime:
+        reason = 'settings file has changed'
+      else:
+        sanity_data = open(sanity_file).read().rstrip()
+        if sanity_data != expected:
+          reason = 'system change: %s vs %s' % (expected, sanity_data)
+        elif not force:
+          return # all is well
+
     if reason:
       logger.warning('(Emscripten: %s, clearing cache)' % reason)
       Cache.erase()
-      force = False # the check actually failed, so definitely write out the sanity file, to avoid others later seeing failures too
+      # the check actually failed, so definitely write out the sanity file, to
+      # avoid others later seeing failures too
+      force = False
 
     # some warning, mostly not fatal checks - do them even if EM_IGNORE_SANITY is on
-    check_llvm_version()
     check_node_version()
 
     llvm_ok = check_llvm()
@@ -564,42 +586,15 @@ def check_sanity(force=False):
       logger.info('EM_IGNORE_SANITY set, ignoring sanity checks')
       return
 
-    logger.info('(Emscripten: Running sanity checks)')
-
-    with ToolchainProfiler.profile_block('sanity compiler_engine'):
-      if not jsrun.check_engine(COMPILER_ENGINE):
-        exit_with_error('The JavaScript shell used for compiling (%s) does not seem to work, check the paths in %s', COMPILER_ENGINE, EM_CONFIG)
-
-    with ToolchainProfiler.profile_block('sanity LLVM'):
-      for cmd in [CLANG, LLVM_LINK, LLVM_AR, LLVM_OPT, LLVM_AS, LLVM_DIS, LLVM_NM, LLVM_INTERPRETER]:
-        if not os.path.exists(cmd) and not os.path.exists(cmd + '.exe'):  # .exe extension required for Windows
-          exit_with_error('Cannot find %s, check the paths in %s', cmd, EM_CONFIG)
-
-    if not os.path.exists(PYTHON) and not os.path.exists(cmd + '.exe'):
-      try:
-        run_process([PYTHON, '--xversion'], stdout=PIPE, stderr=PIPE)
-      except:
-        exit_with_error('Cannot find %s, check the paths in %s', PYTHON, EM_CONFIG)
-
     if not llvm_ok:
       exit_with_error('failing sanity checks due to previous llvm failure')
 
-    # Sanity check passed!
-    with ToolchainProfiler.profile_block('sanity closure compiler'):
-      if not check_closure_compiler():
-        logger.warning('closure compiler will not be available')
+    perform_sanify_checks()
 
     if not force:
       # Only create/update this file if the sanity check succeeded, i.e., we got here
-      f = open(sanity_file, 'w')
-      f.write(generate_sanity())
-      f.close()
-
-  except Exception as e:
-    # Any error here is not worth failing on
-    print('WARNING: sanity check failed to run', e)
-  finally:
-    ToolchainProfiler.exit_block('sanity')
+      with open(sanity_file, 'w') as f:
+        f.write(expected)
 
 
 # Tools/paths
@@ -781,7 +776,8 @@ EMAR = path_from_root('emar.py')
 EMRANLIB = path_from_root('emranlib')
 EMCONFIG = path_from_root('em-config')
 EMLINK = path_from_root('emlink.py')
-EMMAKEN = path_from_root('tools', 'emmaken.py')
+EMCONFIGURE = path_from_root('emconfigure.py')
+EMMAKE = path_from_root('emmake.py')
 AUTODEBUGGER = path_from_root('tools', 'autodebugger.py')
 EXEC_LLVM = path_from_root('tools', 'exec_llvm.py')
 FILE_PACKAGER = path_from_root('tools', 'file_packager.py')
@@ -870,7 +866,6 @@ class WarningManager(object):
 
 class Configuration(object):
   def __init__(self, environ=os.environ):
-    self.DEBUG = int(environ.get('EMCC_DEBUG', '0'))
     self.EMSCRIPTEN_TEMP_DIR = None
 
     if "EMCC_TEMP_DIR" in environ:
@@ -888,7 +883,7 @@ class Configuration(object):
 
     self.CANONICAL_TEMP_DIR = get_canonical_temp_dir(self.TEMP_DIR)
 
-    if self.DEBUG:
+    if DEBUG:
       try:
         self.EMSCRIPTEN_TEMP_DIR = self.CANONICAL_TEMP_DIR
         safe_ensure_dirs(self.EMSCRIPTEN_TEMP_DIR)
@@ -897,27 +892,19 @@ class Configuration(object):
 
   def get_temp_files(self):
     return tempfiles.TempFiles(
-      tmp=self.TEMP_DIR if not self.DEBUG else get_emscripten_temp_dir(),
+      tmp=self.TEMP_DIR if not DEBUG else get_emscripten_temp_dir(),
       save_debug_files=os.environ.get('EMCC_DEBUG_SAVE'))
 
 
 def apply_configuration():
-  global configuration, DEBUG, EMSCRIPTEN_TEMP_DIR, CANONICAL_TEMP_DIR, TEMP_DIR
+  global configuration, EMSCRIPTEN_TEMP_DIR, CANONICAL_TEMP_DIR, TEMP_DIR
   configuration = Configuration()
-  DEBUG = configuration.DEBUG
   EMSCRIPTEN_TEMP_DIR = configuration.EMSCRIPTEN_TEMP_DIR
   CANONICAL_TEMP_DIR = configuration.CANONICAL_TEMP_DIR
   TEMP_DIR = configuration.TEMP_DIR
 
 
-def set_logging():
-  level = logging.DEBUG if DEBUG else logging.INFO
-  # can add  %(asctime)s  to see timestamps
-  logging.basicConfig(format='%(name)s:%(levelname)s: %(message)s', level=level)
-
-
 apply_configuration()
-set_logging()
 
 # EM_CONFIG stuff
 if JS_ENGINES is None:
@@ -971,7 +958,7 @@ def check_vanilla():
       return saved_file
 
     is_vanilla_file = temp_cache.get('is_vanilla', get_vanilla_file, extension='.txt')
-    if CONFIG_FILE and os.stat(CONFIG_FILE).st_mtime > os.stat(is_vanilla_file).st_mtime:
+    if CONFIG_FILE and os.path.getmtime(CONFIG_FILE) > os.path.getmtime(is_vanilla_file):
       logger.debug('config file changed since we checked vanilla; re-checking')
       is_vanilla_file = temp_cache.get('is_vanilla', get_vanilla_file, extension='.txt', force=True)
     try:
@@ -1154,12 +1141,6 @@ def unique_ordered(values):
   return list(filter(check, values))
 
 
-def expand_response(data):
-  if type(data) == str and data[0] == '@':
-    return json.loads(open(data[1:]).read())
-  return data
-
-
 def expand_byte_size_suffixes(value):
   """Given a string with arithmetic and/or KB/MB size suffixes, such as
   "1024*1024" or "32MB", computes how many bytes that is and returns it as an
@@ -1183,30 +1164,11 @@ class SettingsManager(object):
     @classmethod
     def reset(self):
       self.attrs = {}
-      self.load()
 
-    # Given some emcc-type args (-O3, -s X=Y, etc.), fill Settings with the right settings
-    @classmethod
-    def load(self, args=[]):
       # Load the JS defaults into python
       settings = open(path_from_root('src', 'settings.js')).read().replace('//', '#')
-      settings = re.sub(r'var ([\w\d]+)', r'self.attrs["\1"]', settings)
-      exec(settings)
-
-      # Apply additional settings. First -O, then -s
-      for arg in args:
-        if arg.startswith('-O'):
-          v = arg[2]
-          shrink = 0
-          if v in ['s', 'z']:
-            shrink = 1 if v == 's' else 2
-            v = '2'
-          level = int(v)
-          self.apply_opt_level(level, shrink)
-      for i in range(len(args)):
-        if args[i] == '-s':
-          declare = re.sub(r'([\w\d]+)\s*=\s*(.+)', r'self.attrs["\1"]=\2;', args[i + 1])
-          exec(declare)
+      settings = re.sub(r'var ([\w\d]+)', r'attrs["\1"]', settings)
+      exec(settings, {'attrs': self.attrs})
 
       if get_llvm_target() == WASM_TARGET:
         self.attrs['WASM_BACKEND'] = 1
@@ -1286,6 +1248,9 @@ class SettingsManager(object):
 
 
 def verify_settings():
+  if Settings.WASM and Settings.EXPORT_FUNCTION_TABLES:
+      exit_with_error('emcc: EXPORT_FUNCTION_TABLES incompatible with WASM')
+
   if Settings.WASM_BACKEND:
     if not Settings.WASM:
       # TODO(sbc): Make this into a hard error.  We still have a few places that
@@ -1293,10 +1258,6 @@ def verify_settings():
       # generate_struct_info).
       logger.warn('emcc: WASM_BACKEND is not compatible with asmjs (WASM=0), forcing WASM=1')
       Settings.WASM = 1
-
-    if not BINARYEN_ROOT:
-      exit_with_error('emcc: BINARYEN_ROOT must be set in the .emscripten config'
-                      ' when using the LLVM wasm backend')
 
     if Settings.CYBERDWARF:
       exit_with_error('emcc: CYBERDWARF is not supported by the LLVM wasm backend')
@@ -1406,6 +1367,22 @@ class Building(object):
   JS_ENGINE_OVERRIDE = None # Used to pass the JS engine override from runner.py -> test_benchmark.py
   multiprocessing_pool = None
 
+  # internal caches
+  internal_nm_cache = {} # cache results of nm - it can be slow to run
+  uninternal_nm_cache = {}
+  ar_contents = {} # Stores the object files contained in different archive files passed as input
+  _is_ar_cache = {}
+
+  # clear internal caches. this is not normally needed, except if the clang/LLVM
+  # used changes inside this invocation of Building, which can happen in the benchmarker
+  # when it compares different builds.
+  @staticmethod
+  def clear():
+    Building.internal_nm_cache = {}
+    Building.uninternal_nm_cache = {}
+    Building.ar_contents = {}
+    Building._is_ar_cache = {}
+
   @staticmethod
   def get_num_cores():
     return int(os.environ.get('EMCC_CORES', multiprocessing.cpu_count()))
@@ -1417,6 +1394,10 @@ class Building(object):
   def get_multiprocessing_pool():
     if not Building.multiprocessing_pool:
       cores = Building.get_num_cores()
+      if DEBUG:
+        # When in EMCC_DEBUG mode, only use a single core in the pool, so that
+        # logging is not all jumbled up.
+        cores = 1
 
       # If running with one core only, create a mock instance of a pool that does not
       # actually spawn any new subprocesses. Very useful for internal debugging.
@@ -1427,6 +1408,21 @@ class Building(object):
             for t in tasks:
               results += [func(t)]
             return results
+
+          def map_async(self, func, tasks, **kwargs):
+            class Result:
+              def __init__(self, func, tasks):
+                self.func = func
+                self.tasks = tasks
+
+              def get(self, timeout):
+                results = []
+                for t in tasks:
+                  results += [func(t)]
+                return results
+
+            return Result(func, tasks)
+
         Building.multiprocessing_pool = FakeMultiprocessor()
       else:
         child_env = [
@@ -1889,6 +1885,7 @@ class Building(object):
         '--no-entry',
         '--allow-undefined',
         '--import-memory',
+        '--import-table',
         '--export',
         '__wasm_call_ctors',
         '--export',
@@ -1913,7 +1910,7 @@ class Building(object):
     # if Settings.DEBUG_LEVEL < 2 and not Settings.PROFILING_FUNCS:
     #   cmd.append('--strip-debug')
 
-    for export in expand_response(Settings.EXPORTED_FUNCTIONS):
+    for export in Settings.EXPORTED_FUNCTIONS:
       cmd += ['--export', export[1:]] # Strip the leading underscore
     if Settings.EXPORT_ALL:
       cmd += ['--export-all']
@@ -2182,10 +2179,6 @@ class Building(object):
           defs.append(symbol)
     return ObjectFileInfo(0, None, set(defs), set(undefs), set(commons))
 
-  internal_nm_cache = {} # cache results of nm - it can be slow to run
-  uninternal_nm_cache = {}
-  ar_contents = {} # Stores the object files contained in different archive files passed as input
-
   @staticmethod
   def llvm_nm_uncached(filename, stdout=PIPE, stderr=PIPE, include_internal=False):
     # LLVM binary ==> list of symbols
@@ -2252,6 +2245,16 @@ class Building(object):
     return Settings.INLINING_LIMIT == 0
 
   @staticmethod
+  def need_asm_js_file():
+    # Explicitly separate asm.js requires it
+    if Settings.SEPARATE_ASM:
+      return True
+    # A binaryen method may require it.
+    if 'asmjs' in Settings.BINARYEN_METHOD or 'interpret-asm2wasm' in Settings.BINARYEN_METHOD:
+      return True
+    return False
+
+  @staticmethod
   def is_wasm_only():
     # not even wasm, much less wasm-only
     if not Settings.WASM:
@@ -2285,7 +2288,7 @@ class Building(object):
     if Settings.LINKABLE:
       return [] # do not internalize anything
 
-    exps = expand_response(Settings.EXPORTED_FUNCTIONS)
+    exps = Settings.EXPORTED_FUNCTIONS
     internalize_public_api = '-internalize-public-api-'
     internalize_list = ','.join([exp[1:] for exp in exps])
 
@@ -2523,6 +2526,11 @@ class Building(object):
         if 'import' in item:
           if item['import'][1][0] == '_':
             item['import'][1] = item['import'][1][1:]
+    # map import names from wasm to JS, using the actual name the wasm uses for the import
+    import_name_map = {}
+    for item in graph:
+      if 'import' in item:
+        import_name_map[item['name']] = 'emcc$import$' + item['import'][1]
     temp = temp_files.get('.txt').name
     txt = json.dumps(graph)
     with open(temp, 'w') as f:
@@ -2538,6 +2546,8 @@ class Building(object):
     for line in out.splitlines():
       if line.startswith(PREFIX):
         name = line.replace(PREFIX, '').strip()
+        if name in import_name_map:
+          name = import_name_map[name]
         unused.append(name)
     # remove them
     passes = ['applyDCEGraphRemovals']
@@ -2551,6 +2561,7 @@ class Building(object):
     logger.debug('minifying wasm imports and exports')
     # run the pass
     cmd = [os.path.join(Building.get_binaryen_bin(), 'wasm-opt'), '--minify-imports-and-exports', wasm_file, '-o', wasm_file]
+    cmd += Building.get_binaryen_feature_flags()
     if debug_info:
       cmd.append('-g')
     out = check_call(cmd, stdout=PIPE).stdout
@@ -2570,7 +2581,6 @@ class Building(object):
 
   # the exports the user requested
   user_requested_exports = []
-  _is_ar_cache = {}
 
   @staticmethod
   def is_ar(filename):
@@ -2671,6 +2681,16 @@ class Building(object):
     if 'USE_SDL=2' in link_settings:
       system_js_libraries += ['library_egl.js', 'library_glut.js', 'library_gl.js']
     return [path_from_root('src', x) for x in system_js_libraries]
+
+  @staticmethod
+  def get_binaryen_feature_flags():
+    # start with the MVP features, add the rest as needed
+    ret = ['--mvp-features']
+    if Settings.USE_PTHREADS:
+      ret += ['--enable-threads']
+    if Settings.SIMD:
+      ret += ['--enable-simd']
+    return ret
 
   @staticmethod
   def get_binaryen():
@@ -2833,8 +2853,8 @@ class JS(object):
     return ret
 
   @staticmethod
-  def make_jscall(sig, sig_order=0, named=True):
-    fnargs = ','.join(['a' + str(i) for i in range(1, len(sig))])
+  def make_jscall(sig, sig_order=None):
+    fnargs = ','.join('a' + str(i) for i in range(1, len(sig)))
     args = 'index' + (',' if fnargs else '') + fnargs
     # While asm.js/fastcomp's addFunction support preallocates
     # Settings.RESERVED_FUNCTION_POINTERS slots in functionPointers array, on
@@ -2848,12 +2868,14 @@ class JS(object):
     # e.g. When there are three possible function signature, ['v', 'ii', 'ff'],
     # the 'sig_order' parameter will be 0 for 'v', 1 for 'ii', and so on.
     if Settings.WASM_BACKEND:
+      assert sig_order is not None
       index = 'index + %d' % (Settings.RESERVED_FUNCTION_POINTERS * sig_order)
     else:
       index = 'index'
-    ret = '''function%s(%s) {
+    ret = '''\
+function jsCall_%s(%s) {
     %sfunctionPointers[%s](%s);
-}''' % ((' jsCall_' + sig) if named else '', args, 'return ' if sig[0] != 'v' else '', index, fnargs)
+}''' % (sig, args, 'return ' if sig[0] != 'v' else '', index, fnargs)
     return ret
 
   @staticmethod
@@ -2952,7 +2974,7 @@ class WebAssembly(object):
     return bytearray(ret)
 
   @staticmethod
-  def make_shared_library(js_file, wasm_file):
+  def make_shared_library(js_file, wasm_file, needed_dynlibs):
     # a wasm shared library has a special "dylink" section, see tools-conventions repo
     js = open(js_file).read()
     m = re.search("var STATIC_BUMP = (\d+);", js)
@@ -2975,6 +2997,34 @@ class WebAssembly(object):
     name = b"\06dylink" # section name, including prefixed size
     contents = (WebAssembly.lebify(mem_size) + WebAssembly.lebify(mem_align) +
                 WebAssembly.lebify(table_size) + WebAssembly.lebify(0))
+
+    # we extend "dylink" section with information about which shared libraries
+    # our shared library needs. This is similar to DT_NEEDED entries in ELF.
+    #
+    # In theory we could avoid doing this, since every import in wasm has
+    # "module" and "name" attributes, but currently emscripten almost always
+    # uses just "env" for "module". This way we have to embed information about
+    # required libraries for the dynamic linker somewhere, and "dylink" section
+    # seems to be the most relevant place.
+    #
+    # Binary format of the extension:
+    #
+    #   needed_dynlibs_count        varuint32       ; number of needed shared libraries
+    #   needed_dynlibs_entries      dynlib_entry*   ; repeated dynamic library entries as described below
+    #
+    # dynlib_entry:
+    #
+    #   dynlib_name_len             varuint32       ; length of dynlib_name_str in bytes
+    #   dynlib_name_str             bytes           ; name of a needed dynamic library: valid UTF-8 byte sequence
+    #
+    # a proposal has been filed to include the extension into "dylink" specification:
+    # https://github.com/WebAssembly/tool-conventions/pull/77
+    contents += WebAssembly.lebify(len(needed_dynlibs))
+    for dyn_needed in needed_dynlibs:
+      dyn_needed = asbytes(dyn_needed)
+      contents += WebAssembly.lebify(len(dyn_needed))
+      contents += dyn_needed
+
     size = len(name) + len(contents)
     f.write(WebAssembly.lebify(size))
     f.write(name)

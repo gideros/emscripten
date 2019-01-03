@@ -42,9 +42,6 @@ var NEED_ALL_ASM2WASM_IMPORTS = BINARYEN_METHOD != 'native-wasm' || BINARYEN_TRA
 // the current compilation unit.
 var HAS_MAIN = ('_main' in IMPLEMENTED_FUNCTIONS) || MAIN_MODULE || SIDE_MODULE;
 
-var WASM_BACKEND_WITH_RESERVED_FUNCTION_POINTERS =
-  WASM_BACKEND && RESERVED_FUNCTION_POINTERS;
-
 // JSifier
 function JSify(data, functionsOnly) {
   var mainPass = !functionsOnly;
@@ -544,13 +541,18 @@ function JSify(data, functionsOnly) {
           }
         }
         for(i in proxiedFunctionInvokers) print(proxiedFunctionInvokers[i]+'\n');
-        print('if (!ENVIRONMENT_IS_PTHREAD) {\n // Only main thread initializes these, pthreads copy them over at thread worker init time (in pthread-main.js)');
+        print('if (!ENVIRONMENT_IS_PTHREAD) {\n // Only main thread initializes these, pthreads copy them over at thread worker init time (in worker.js)');
       }
       print('DYNAMICTOP_PTR = staticAlloc(4);\n');
       print('STACK_BASE = STACKTOP = alignMemory(STATICTOP);\n');
       if (STACK_START > 0) print('if (STACKTOP < ' + STACK_START + ') STACK_BASE = STACKTOP = alignMemory(' + STACK_START + ');\n');
       print('STACK_MAX = STACK_BASE + TOTAL_STACK;\n');
       print('DYNAMIC_BASE = alignMemory(STACK_MAX);\n');
+      if (WASM_BACKEND) {
+        // wasm backend stack goes down
+        print('STACKTOP = STACK_BASE + TOTAL_STACK;');
+        print('STACK_MAX = STACK_BASE;');
+      }
       print('HEAP32[DYNAMICTOP_PTR>>2] = DYNAMIC_BASE;\n');
       print('staticSealed = true; // seal the static portion of memory\n');
       if (ASSERTIONS) print('assert(DYNAMIC_BASE < TOTAL_MEMORY, "TOTAL_MEMORY not big enough for stack");\n');

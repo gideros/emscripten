@@ -611,7 +611,9 @@ function lengthBytesUTF8(str) {
 // Given a pointer 'ptr' to a null-terminated UTF16LE-encoded string in the emscripten HEAP, returns
 // a copy of that string as a Javascript String object.
 
+#if TEXTDECODER
 var UTF16Decoder = typeof TextDecoder !== 'undefined' ? new TextDecoder('utf-16le') : undefined;
+#endif
 function UTF16ToString(ptr) {
 #if ASSERTIONS
   assert(ptr % 2 == 0, 'Pointer passed to UTF16ToString must be aligned to two bytes!');
@@ -908,7 +910,7 @@ var STACK_BASE, STACKTOP, STACK_MAX; // stack area
 var DYNAMIC_BASE, DYNAMICTOP_PTR; // dynamic area handled by sbrk
 
 #if USE_PTHREADS
-if (!ENVIRONMENT_IS_PTHREAD) { // Pthreads have already initialized these variables in src/pthread-main.js, where they were passed to the thread worker at startup time
+if (!ENVIRONMENT_IS_PTHREAD) { // Pthreads have already initialized these variables in src/worker.js, where they were passed to the thread worker at startup time
 #endif
   STATIC_BASE = STATICTOP = STACK_BASE = STACKTOP = STACK_MAX = DYNAMIC_BASE = DYNAMICTOP_PTR = 0;
   staticSealed = false;
@@ -962,6 +964,7 @@ function abortOnCannotGrowMemory() {
 }
 #endif
 
+#if WASM == 0
 #if ALLOW_MEMORY_GROWTH
 if (!Module['reallocBuffer']) Module['reallocBuffer'] = function(size) {
   var ret;
@@ -977,7 +980,8 @@ if (!Module['reallocBuffer']) Module['reallocBuffer'] = function(size) {
   if (!success) return false;
   return ret;
 };
-#endif
+#endif // ALLOW_MEMORY_GROWTH
+#endif // WASM == 0
 
 function enlargeMemory() {
 #if USE_PTHREADS
@@ -1622,11 +1626,9 @@ addOnPreRun(function() {
   function loadDynamicLibraries(libs) {
     if (libs) {
       libs.forEach(function(lib) {
-        loadDynamicLibrary(lib);
+        // libraries linked to main never go away
+        loadDynamicLibrary(lib, {global: true, nodelete: true});
       });
-    }
-    if (Module['asm']['runPostSets']) {
-      Module['asm']['runPostSets']();
     }
   }
   // if we can load dynamic libraries synchronously, do so, otherwise, preload
@@ -1634,22 +1636,11 @@ addOnPreRun(function() {
   if (Module['dynamicLibraries'] && Module['dynamicLibraries'].length > 0 && !Module['readBinary']) {
     // we can't read binary data synchronously, so preload
     addRunDependency('preload_dynamicLibraries');
-    var binaries = [];
-    Module['dynamicLibraries'].forEach(function(lib) {
-      fetch(lib, { credentials: 'same-origin' }).then(function(response) {
-        if (!response['ok']) {
-          throw "failed to load wasm binary file at '" + lib + "'";
-        }
-        return response['arrayBuffer']();
-      }).then(function(buffer) {
-        var binary = new Uint8Array(buffer);
-        binaries.push(binary);
-        if (binaries.length === Module['dynamicLibraries'].length) {
-          // we got them all, wonderful
-          loadDynamicLibraries(binaries);
-          removeRunDependency('preload_dynamicLibraries');
-        }
-      });
+    Promise.all(Module['dynamicLibraries'].map(function(lib) {
+      return loadDynamicLibrary(lib, {loadAsync: true, global: true, nodelete: true});
+    })).then(function() {
+      // we got them all, wonderful
+      removeRunDependency('preload_dynamicLibraries');
     });
     return;
   }
@@ -1929,14 +1920,6 @@ function integrateWasmJS() {
       if (exports.memory) mergeMemory(exports.memory);
       Module['asm'] = exports;
       Module["usingWasm"] = true;
-#if WASM_BACKEND
-      // wasm backend stack goes down
-      STACKTOP = STACK_BASE + TOTAL_STACK;
-      STACK_MAX = STACK_BASE;
-      // can't call stackRestore() here since this function can be called
-      // synchronously before stackRestore() is declared.
-      Module["asm"]["stackRestore"](STACKTOP);
-#endif
 #if USE_PTHREADS
       // Keep a reference to the compiled module so we can post it to the workers.
       Module['wasmModule'] = module;
@@ -2148,13 +2131,15 @@ function integrateWasmJS() {
 
   // Provide an "asm.js function" for the application, called to "link" the asm.js module. We instantiate
   // the wasm module at that time, and it receives imports and provides exports and so forth, the app
-  // doesn't need to care that it is wasm or olyfilled wasm or asm.js.
+  // doesn't need to care that it is wasm or polyfilled wasm or asm.js.
 
   Module['asm'] = function(global, env, providedBuffer) {
     // import table
     if (!env['table']) {
+#if ASSERTIONS
+     assert(Module['wasmTableSize'] !== undefined);
+#endif
       var TABLE_SIZE = Module['wasmTableSize'];
-      if (TABLE_SIZE === undefined) TABLE_SIZE = 1024; // works in binaryen interpreter at least
       var MAX_TABLE_SIZE = Module['wasmMaxTableSize'];
       if (typeof WebAssembly === 'object' && typeof WebAssembly.Table === 'function') {
         if (MAX_TABLE_SIZE !== undefined) {

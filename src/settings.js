@@ -395,7 +395,7 @@ var FULL_ES2 = 0;
 var GL_EMULATE_GLES_VERSION_STRING_FORMAT = 1;
 
 // Some old Android WeChat (Chromium 37?) browser has a WebGL bug that it ignores
-// the offset of a typed array view pointing to an ArrayBuffer. Set this to 
+// the offset of a typed array view pointing to an ArrayBuffer. Set this to
 // 1 to enable a polyfill that works around the issue when it appears. This
 // bug is only relevant to WebGL 1, the affected browsers do not support WebGL 2.
 var WORKAROUND_OLD_WEBGL_UNIFORM_UPLOAD_IGNORED_OFFSET_BUG = 0;
@@ -559,7 +559,7 @@ var EXTRA_EXPORTED_RUNTIME_METHODS = [];
 var FS_LOG = 0;
 
 // If set to nonzero, the provided virtual filesystem if treated
-// case-insensitive, like Windows and OSX do. If set to 0, the VFS is
+// case-insensitive, like Windows and macOS do. If set to 0, the VFS is
 // case-sensitive, like on Linux.
 var CASE_INSENSITIVE_FS = 0;
 
@@ -683,9 +683,8 @@ var MAIN_MODULE = 0;
 // Corresponds to MAIN_MODULE (also supports modes 1 and 2)
 var SIDE_MODULE = 0;
 
-// If this is a main module (MAIN_MODULE == 1), then
-// we will link these at runtime. They must have been built with
-// SIDE_MODULE == 1.
+// If this is a shared object (MAIN_MODULE == 1 || SIDE_MODULE == 1), then we
+// will link these at runtime. They must have been built with SIDE_MODULE == 1.
 var RUNTIME_LINKED_LIBS = [];
 
 // If set to 1, this is a worker library, a special kind of library that is run
@@ -739,7 +738,7 @@ var WARN_ON_UNDEFINED_SYMBOLS = 1;
 // EXPORTED_FUNCTIONS will also be reported.
 var ERROR_ON_UNDEFINED_SYMBOLS = 1;
 
-// If set to 1, any -lfoo directives pointing to nonexisting library files will
+// If set to 1, any -lfoo directives pointing to nonexistent library files will
 // issue a linker error.
 
 // The default value for this is currently 0, but will be transitioned to 1 in
@@ -827,7 +826,7 @@ var MODULARIZE = 0;
 // EXPORT_NAME() to create the instance manually.
 //
 // Note that the promise-like API MODULARIZE provides isn't available here
-// (since you arean't creating the instance yourself).
+// (since you aren't creating the instance yourself).
 var MODULARIZE_INSTANCE = 0;
 
 // Export using an ES6 Module export rather than a UMD export.  MODULARIZE must
@@ -1070,6 +1069,10 @@ var USE_OGG = 0;
 // 1 = use freetype from emscripten-ports
 var USE_FREETYPE = 0;
 
+// Specify the SDL_mixer version that is being linked against.
+// Doesn't *have* to match USE_SDL, but a good idea.
+var USE_SDL_MIXER = 1;
+
 // 1 = use harfbuzz from harfbuzz upstream
 var USE_HARFBUZZ = 0;
 
@@ -1254,6 +1257,9 @@ var WASM_BINARY_FILE = '';
 
 // For internal use only (name of the file containing asm.js, if relevant).
 var ASMJS_CODE_FILE = '';
+
+// For internal use only (name of the file containing the pthread *.worker.js, if relevant).
+var PTHREAD_WORKER_FILE = '';
 
 // Base URL the source mapfile, if relevant
 var SOURCE_MAP_BASE = '';

@@ -534,7 +534,8 @@ def update_settings_glue(metadata):
 
   # Integrate info from backend
   if shared.Settings.SIDE_MODULE:
-    shared.Settings.DEFAULT_LIBRARY_FUNCS_TO_INCLUDE = [] # we don't need any JS library contents in side modules
+    # we don't need any JS library contents in side modules
+    shared.Settings.DEFAULT_LIBRARY_FUNCS_TO_INCLUDE = []
 
   if metadata.get('cantValidate') and shared.Settings.ASM_JS != 2:
     logger.warning('disabling asm.js validation due to use of non-supported features: ' + metadata['cantValidate'])
@@ -637,7 +638,7 @@ def get_js_funcs(pre, funcs):
 
 def get_all_exported_functions(function_table_data):
   # both asm.js and otherwise
-  all_exported_functions = set(shared.expand_response(shared.Settings.EXPORTED_FUNCTIONS))
+  all_exported_functions = set(shared.Settings.EXPORTED_FUNCTIONS)
 
   # additional functions to export from asm, if they are implemented
   for additional_export in shared.Settings.DEFAULT_LIBRARY_FUNCS_TO_INCLUDE:
@@ -654,17 +655,8 @@ def get_all_implemented(forwarded_json, metadata):
   return metadata['implementedFunctions'] + list(forwarded_json['Functions']['implementedFunctions'].keys()) # XXX perf?
 
 
-# Return the list of original exports, for error reporting. It may
-# be a response file, in which case, load it
-def get_original_exported_functions():
-  ret = shared.Settings.ORIGINAL_EXPORTED_FUNCTIONS
-  if ret and ret[0] == '@':
-    ret = json.loads(open(ret[1:]).read())
-  return ret
-
-
 def check_all_implemented(all_implemented, pre):
-  for requested in get_original_exported_functions():
+  for requested in shared.Settings.ORIGINAL_EXPORTED_FUNCTIONS:
     if not is_already_implemented(requested, pre, all_implemented):
       # could be a js library func
       if shared.Settings.ERROR_ON_UNDEFINED_SYMBOLS:
@@ -692,15 +684,12 @@ def get_exported_implemented_functions(all_exported_functions, all_implemented, 
 
   funcs = list(funcs) + metadata['initializers']
   if not shared.Settings.ONLY_MY_CODE:
-    funcs.append('runPostSets')
     if shared.Settings.ALLOW_MEMORY_GROWTH:
       funcs.append('_emscripten_replace_memory')
     if not shared.Settings.SIDE_MODULE:
       funcs += ['stackAlloc', 'stackSave', 'stackRestore', 'establishStackSpace']
     if shared.Settings.SAFE_HEAP:
       funcs += ['setDynamicTop']
-    if not shared.Settings.RELOCATABLE:
-      funcs += ['setTempRet0', 'getTempRet0']
     if not (shared.Settings.WASM and shared.Settings.SIDE_MODULE):
       funcs += ['setThrew']
     if shared.Settings.EMTERPRETIFY:
@@ -1033,7 +1022,7 @@ function jsCall_%s_%s(%s) {
 def create_mftCall_funcs(function_table_data):
   if not shared.Settings.EMULATED_FUNCTION_POINTERS:
     return []
-  if (not shared.Settings.RELOCATABLE) or shared.Settings.WASM:
+  if shared.Settings.WASM or not shared.Settings.RELOCATABLE:
     return []
 
   mftCall_funcs = []
@@ -1352,7 +1341,7 @@ function ftCall_%s(%s) {%s
 
 
 def create_basic_funcs(function_table_sigs, invoke_function_names):
-  basic_funcs = ['abort', 'assert', 'enlargeMemory', 'getTotalMemory']
+  basic_funcs = ['abort', 'assert', 'enlargeMemory', 'getTotalMemory', 'setTempRet0', 'getTempRet0']
   if shared.Settings.ABORTING_MALLOC:
     basic_funcs += ['abortOnCannotGrowMemory']
   if shared.Settings.STACK_OVERFLOW_CHECK:
@@ -1367,8 +1356,6 @@ def create_basic_funcs(function_table_sigs, invoke_function_names):
   if shared.Settings.ASSERTIONS:
     for sig in function_table_sigs:
       basic_funcs += ['nullFunc_' + sig]
-  if shared.Settings.RELOCATABLE:
-    basic_funcs += ['setTempRet0', 'getTempRet0']
 
   basic_funcs += invoke_function_names
 
@@ -1435,8 +1422,6 @@ def create_asm_runtime_funcs():
   funcs = []
   if not (shared.Settings.WASM and shared.Settings.SIDE_MODULE):
     funcs += ['stackAlloc', 'stackSave', 'stackRestore', 'establishStackSpace', 'setThrew']
-  if not shared.Settings.RELOCATABLE:
-    funcs += ['setTempRet0', 'getTempRet0']
   if shared.Settings.SAFE_HEAP:
     funcs += ['setDynamicTop']
   if shared.Settings.ONLY_MY_CODE:
@@ -1477,9 +1462,10 @@ def create_receiving(function_table_data, function_tables_defs, exported_impleme
   assert(runtimeInitialized, 'you need to wait for the runtime to be ready (e.g. wait for main() to be called)');
   assert(!runtimeExited, 'the runtime was exited (use NO_EXIT_RUNTIME to keep it alive after main() exits)');
 '''
-    receiving = '\n'.join(['var real_' + s + ' = asm["' + s + '"]; asm["' + s + '''"] = function() {''' + runtime_assertions + '''  return real_''' + s + '''.apply(null, arguments);
+    receiving = [f for f in exported_implemented_functions if f not in ('_memcpy', '_memset', '_emscripten_replace_memory', '__start_module')]
+    receiving = '\n'.join('var real_' + s + ' = asm["' + s + '"]; asm["' + s + '''"] = function() {''' + runtime_assertions + '''  return real_''' + s + '''.apply(null, arguments);
 };
-''' for s in exported_implemented_functions if s not in ['_memcpy', '_memset', 'runPostSets', '_emscripten_replace_memory', '__start_module']])
+''' for s in receiving)
   if not shared.Settings.SWAPPABLE_ASM_MODULE:
     receiving += ';\n'.join(['var ' + s + ' = Module["' + s + '"] = asm["' + s + '"]' for s in exported_implemented_functions + function_tables(function_table_data)])
   else:
@@ -1690,17 +1676,6 @@ function SAFE_FT_MASK(value, mask) {
 }
 ''')
 
-  if not shared.Settings.RELOCATABLE:
-    funcs.append('''
-function setTempRet0(value) {
-  value = value|0;
-  tempRet0 = value;
-}
-function getTempRet0() {
-  return tempRet0|0;
-}
-''')
-
   return funcs
 
 
@@ -1742,9 +1717,6 @@ def create_asm_temp_vars():
   var nan = global%s, inf = global%s;
   var tempInt = 0, tempBigInt = 0, tempBigIntS = 0, tempValue = 0, tempDouble = 0.0;
 ''' % (access_quote('NaN'), access_quote('Infinity'))
-
-  if not shared.Settings.RELOCATABLE:
-    rtn += 'var tempRet0 = 0;\n'
 
   return rtn
 
@@ -1941,7 +1913,7 @@ def emscript_wasm_backend(infile, outfile, memfile, libraries, compiler_engine,
   receiving = create_receiving_wasm(exported_implemented_functions)
 
   module = create_module_wasm(sending, receiving, invoke_funcs, jscall_sigs,
-                              exported_implemented_functions)
+                              exported_implemented_functions, metadata)
 
   write_output_file(outfile, post, module)
   module = None
@@ -1950,8 +1922,8 @@ def emscript_wasm_backend(infile, outfile, memfile, libraries, compiler_engine,
 
 
 def finalize_wasm(temp_files, infile, outfile, memfile, DEBUG):
-  wasm_emscripten_finalize = os.path.join(shared.BINARYEN_ROOT, 'bin', 'wasm-emscripten-finalize')
-  wasm_dis = os.path.join(shared.BINARYEN_ROOT, 'bin', 'wasm-dis')
+  wasm_emscripten_finalize = os.path.join(shared.Building.get_binaryen_bin(), 'wasm-emscripten-finalize')
+  wasm_dis = os.path.join(shared.Building.get_binaryen_bin(), 'wasm-dis')
 
   def debug_copy(src, dst):
     if DEBUG:
@@ -1961,7 +1933,6 @@ def finalize_wasm(temp_files, infile, outfile, memfile, DEBUG):
         shared.check_call([wasm_dis, src, '-o', os.path.join(shared.CANONICAL_TEMP_DIR, tmp)])
 
   basename = shared.unsuffixed(outfile.name)
-  metadata_file = basename + '.metadata'
   wasm = basename + '.wasm'
   base_wasm = infile
   debug_copy(infile, 'base.wasm')
@@ -1992,25 +1963,18 @@ def finalize_wasm(temp_files, infile, outfile, memfile, DEBUG):
     cmd.append('--output-source-map-url=' + shared.Settings.SOURCE_MAP_BASE + os.path.basename(shared.Settings.WASM_BINARY_FILE) + '.map')
   if not shared.Settings.MEM_INIT_IN_WASM:
     cmd.append('--separate-data-segments=' + memfile)
-  shared.check_call(cmd, stdout=open(metadata_file, 'w'))
+  stdout = shared.check_call(cmd, stdout=subprocess.PIPE).stdout
   if write_source_map:
     debug_copy(wasm + '.map', 'post_finalize.map')
   debug_copy(wasm, 'post_finalize.wasm')
 
-  return create_metadata_wasm(open(metadata_file).read(), DEBUG)
-
-
-def create_metadata_wasm(metadata_raw, DEBUG):
-  metadata = load_metadata(metadata_raw)
-  if DEBUG:
-    logger.debug("Metadata parsed: " + pprint.pformat(metadata))
-  return metadata
+  return load_metadata_wasm(stdout, DEBUG)
 
 
 def create_exported_implemented_functions_wasm(pre, forwarded_json, metadata):
   exported_implemented_functions = set(metadata['exports'])
 
-  all_exported_functions = set(shared.expand_response(shared.Settings.EXPORTED_FUNCTIONS)) # both asm.js and otherwise
+  all_exported_functions = set(shared.Settings.EXPORTED_FUNCTIONS) # both asm.js and otherwise
   for additional_export in shared.Settings.DEFAULT_LIBRARY_FUNCS_TO_INCLUDE: # additional functions to export from asm, if they are implemented
     all_exported_functions.add('_' + additional_export)
   all_implemented = get_all_implemented(forwarded_json, metadata)
@@ -2084,7 +2048,7 @@ def create_em_js(forwarded_json, metadata):
       args = []
     else:
       args = args.split(',')
-    arg_names = [arg.split()[-1] for arg in args if arg]
+    arg_names = [arg.split()[-1].replace("*", "") for arg in args if arg]
     func = 'function {}({}){}'.format(name, ','.join(arg_names), asstr(body))
     em_js_funcs.append(func)
     forwarded_json['Functions']['libraryFunctions'][name] = 1
@@ -2147,7 +2111,7 @@ assert(runtimeInitialized, 'you need to wait for the runtime to be ready (e.g. w
 assert(!runtimeExited, 'the runtime was exited (use NO_EXIT_RUNTIME to keep it alive after main() exits)');
 return real_''' + asmjs_mangle(s) + '''.apply(null, arguments);
 };
-''' for s in exported_implemented_functions if s not in ['_memcpy', '_memset', 'runPostSets', '_emscripten_replace_memory', '__start_module']])
+''' for s in exported_implemented_functions if s not in ['_memcpy', '_memset', '_emscripten_replace_memory', '__start_module']])
 
   if not shared.Settings.SWAPPABLE_ASM_MODULE:
     receiving += ';\n'.join(['var ' + asmjs_mangle(s) + ' = Module["' + asmjs_mangle(s) + '"] = asm["' + s + '"]' for s in exported_implemented_functions])
@@ -2158,43 +2122,26 @@ return real_''' + asmjs_mangle(s) + '''.apply(null, arguments);
 
 
 def create_module_wasm(sending, receiving, invoke_funcs, jscall_sigs,
-                       exported_implemented_functions):
+                       exported_implemented_functions, metadata):
   invoke_wrappers = create_invoke_wrappers(invoke_funcs)
   jscall_funcs = create_jscall_funcs(jscall_sigs)
 
+  module = []
+  module.append('Module%s = {};\n' % access_quote('asmGlobalArg'))
   if shared.Settings.USE_PTHREADS and not shared.Settings.WASM:
-    shared_array_buffer = "if (typeof SharedArrayBuffer !== 'undefined') Module.asmGlobalArg['Atomics'] = Atomics;"
-  else:
-    shared_array_buffer = ''
+    module.append("if (typeof SharedArrayBuffer !== 'undefined') Module.asmGlobalArg['Atomics'] = Atomics;\n")
 
-  module = ['''
-Module%s = {};
-%s
-Module%s = %s;
-''' % (access_quote('asmGlobalArg'), shared_array_buffer, access_quote('asmLibraryArg'), sending) + '''
-var asm = Module['asm'](Module%s, Module%s, buffer);
-%s;
-''' % (access_quote('asmGlobalArg'), access_quote('asmLibraryArg'), receiving)]
+  module.append("Module['wasmTableSize'] = %s;\n" % metadata['tableSize'])
+  module.append('Module%s = %s;\n' % (access_quote('asmLibraryArg'), sending))
+  module.append("var asm = Module['asm'](Module%s, Module%s, buffer);\n" % (access_quote('asmGlobalArg'), access_quote('asmLibraryArg')))
 
-  module.append('''
-var stackAlloc = Module['_stackAlloc'];
-var stackSave = Module['_stackSave'];
-var stackRestore = Module['_stackRestore'];
-var establishStackSpace = Module['establishStackSpace'];
-''')
-
-  # some runtime functionality may not have been generated in
-  # the wasm; provide a JS shim for it
-  for name in ['setTempRet0', 'getTempRet0', 'stackSave', 'stackRestore', 'stackAlloc']:
-    if name not in exported_implemented_functions:
-      module.append('var %s;\n' % name)
-
+  module.append(receiving)
   module.append(invoke_wrappers)
   module.append(jscall_funcs)
   return module
 
 
-def load_metadata(metadata_raw):
+def load_metadata_wasm(metadata_raw, DEBUG):
   try:
     metadata_json = json.loads(metadata_raw)
   except Exception:
@@ -2207,12 +2154,18 @@ def load_metadata(metadata_raw):
     'externs': [],
     'simd': False,
     'maxGlobalAlign': 0,
+    'jsCallStartIndex': 0,
+    'jsCallFuncType': [],
+    'staticBump': 0,
+    'tableSize': 0,
     'initializers': [],
     'exports': [],
     'emJsFuncs': {},
+    'asmConsts': {},
     'invokeFuncs': [],
   }
 
+  assert 'tableSize' in metadata_json.keys()
   for key, value in metadata_json.items():
     # json.loads returns `unicode` for strings but other code in this file
     # generally works with utf8 encoded `str` objects, and they don't alwasy
@@ -2222,10 +2175,15 @@ def load_metadata(metadata_raw):
     # (specifically the glue returned from compile_settings)
     if type(value) == list:
       value = [asstr(v) for v in value]
+    if key not in metadata:
+      exit_with_error('unexpected metadata key received from wasm-emscripten-finalize: %s', key)
     metadata[key] = value
 
   # Initializers call the global var version of the export, so they get the mangled name.
   metadata['initializers'] = [asmjs_mangle(i) for i in metadata['initializers']]
+
+  if DEBUG:
+    logger.debug("Metadata parsed: " + pprint.pformat(metadata))
 
   # functions marked llvm.used in the code are exports requested by the user
   shared.Building.user_requested_exports += metadata['exports']
@@ -2255,7 +2213,7 @@ def asmjs_mangle(name):
   Prepends '_' and replaces non-alphanumerics with '_'.
   Used by wasm backend for JS library consistency with asm.js.
   """
-  library_functions_in_module = ('setThrew', 'setTempRet0', 'getTempRet0')
+  library_functions_in_module = ('setThrew', 'setTempRet0', 'getTempRet0', 'stackAlloc', 'stackSave', 'stackRestore', 'establishStackSpace')
   if name.startswith('dynCall_'):
     return name
   if name in library_functions_in_module:
@@ -2293,5 +2251,5 @@ def main(infile, outfile, memfile, libraries):
 
   emscripter = emscript_wasm_backend if shared.Settings.WASM_BACKEND else emscript
   return temp_files.run_and_clean(lambda: emscripter(
-      infile, outfile_obj, memfile, libraries, shared.COMPILER_ENGINE, temp_files, get_configuration().DEBUG)
+      infile, outfile_obj, memfile, libraries, shared.COMPILER_ENGINE, temp_files, shared.DEBUG)
   )
