@@ -256,7 +256,7 @@ if (ENVIRONMENT_IS_WEB || ENVIRONMENT_IS_WORKER) {
 #if SUPPORT_BASE64_EMBEDDING
     try {
 #endif
-      var xhr = new XMLHttpRequest();
+      var xhr = new (Module['XMLHttpRequest']||XMLHttpRequest)();
       xhr.open('GET', url, false);
       xhr.send(null);
       return xhr.responseText;
@@ -276,7 +276,7 @@ if (ENVIRONMENT_IS_WEB || ENVIRONMENT_IS_WORKER) {
 #if SUPPORT_BASE64_EMBEDDING
       try {
 #endif
-        var xhr = new XMLHttpRequest();
+        var xhr = new (Module['XMLHttpRequest']||XMLHttpRequest)();
         xhr.open('GET', url, false);
         xhr.responseType = 'arraybuffer';
         xhr.send(null);
@@ -294,7 +294,7 @@ if (ENVIRONMENT_IS_WEB || ENVIRONMENT_IS_WORKER) {
   }
 
   Module['readAsync'] = function readAsync(url, onload, onerror) {
-    var xhr = new XMLHttpRequest();
+    var xhr = new (Module['XMLHttpRequest']||XMLHttpRequest)();
     xhr.open('GET', url, true);
     xhr.responseType = 'arraybuffer';
     xhr.onload = function xhr_onload() {
