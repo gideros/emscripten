@@ -177,6 +177,10 @@ function loadDynamicLibrary(lib, flags) {
   // libData <- lib
   function loadLibData() {
 #if WASM
+	if (lib.buffer) {
+		// we were provided the binary, in a typed array
+		return flags.loadAsync ? Promise.resolve(lib) : lib;
+	}
     // for wasm, we can use fetch for async, but for fs mode we can only imitate it
     if (flags.fs) {
       var libData = flags.fs.readFile(lib, {encoding: 'binary'});

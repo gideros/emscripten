@@ -2,7 +2,7 @@
 #if SUPPORT_BASE64_EMBEDDING
     try {
 #endif
-      var xhr = new XMLHttpRequest();
+      var xhr = new (Module['XMLHttpRequest']||XMLHttpRequest)();
       xhr.open('GET', url, false);
       xhr.send(null);
       return xhr.responseText;
@@ -22,7 +22,7 @@
 #if SUPPORT_BASE64_EMBEDDING
       try {
 #endif
-        var xhr = new XMLHttpRequest();
+      var xhr = new (Module['XMLHttpRequest']||XMLHttpRequest)();
         xhr.open('GET', url, false);
         xhr.responseType = 'arraybuffer';
         xhr.send(null);
@@ -40,7 +40,7 @@
   }
 
   readAsync = function readAsync(url, onload, onerror) {
-    var xhr = new XMLHttpRequest();
+    var xhr = new (Module['XMLHttpRequest']||XMLHttpRequest)();
     xhr.open('GET', url, true);
     xhr.responseType = 'arraybuffer';
     xhr.onload = function xhr_onload() {
